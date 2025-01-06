@@ -65,6 +65,7 @@ func cmdSync() *cobra.Command {
 				tracks           = util.ErrWrap([]string{})(cmd.Flags().GetStringArray("track"))
 				fixes            = util.ErrWrap([]string{})(cmd.Flags().GetStringArray("fix"))
 				libraryLimit     = util.ErrWrap(0)(cmd.Flags().GetInt("library-limit"))
+				lyrics           = util.ErrWrap(false)(cmd.Flags().GetBool("lyrics"))
 			)
 
 			for index, path := range fixes {
@@ -82,7 +83,7 @@ func cmdSync() *cobra.Command {
 				routineAuth,
 				routineFetch(library, playlists, playlistsTracks, albums, tracks, fixes, libraryLimit),
 				routineDecide(manual),
-				routineCollect,
+				routineCollect(lyrics),
 				routineProcess,
 				routineInstall,
 				routineMix(playlistEncoding),
@@ -345,25 +346,38 @@ func routineDecide(manualMode bool) func(context.Context, chan error) {
 // collector fetches all the needed assets
 // for a blob to be processed (basically
 // a wrapper around: retriever, composer and painter)
-func routineCollect(_ context.Context, ch chan error) {
-	// remember to stop passing data to installer
-	defer close(routineQueues[routineTypeProcess])
+func routineCollect(lyrics bool) func(context.Context, chan error) {
+	return func(_ context.Context, ch chan error) {
+		// remember to stop passing data to installer
+		defer close(routineQueues[routineTypeProcess])
 
-	for event := range routineQueues[routineTypeCollect] {
-		track := event.(*entity.Track)
-		if err := nursery.RunConcurrently(
-			routineCollectAsset(track),
-			routineCollectLyrics(track),
-			routineCollectArtwork(track),
-		); err != nil {
-			ch <- err
-			return
+		for event := range routineQueues[routineTypeCollect] {
+			track := event.(*entity.Track)
+			if lyrics {
+				if err := nursery.RunConcurrently(
+					routineCollectAsset(track),
+					routineCollectLyrics(track),
+					routineCollectArtwork(track),
+				); err != nil {
+					tui.Printf("failure in routineCollect")
+					ch <- err
+					return
+				}
+			} else {
+				if err := nursery.RunConcurrently(
+					routineCollectAsset(track),
+					routineCollectArtwork(track),
+				); err != nil {
+					ch <- err
+					return
+				}
+			}
+			routineQueues[routineTypeProcess] <- track
 		}
-		routineQueues[routineTypeProcess] <- track
+		tui.Lot("download").Close()
+		tui.Lot("compose").Close()
+		tui.Lot("paint").Close()
 	}
-	tui.Lot("download").Close()
-	tui.Lot("compose").Close()
-	tui.Lot("paint").Close()
 }
 
 // retriever pulls a track blob corresponding
