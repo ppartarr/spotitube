@@ -84,7 +84,7 @@ func processDirectory(dir string, client *spotitubify.Client) error {
 
 func processFile(filePath string, client *spotitubify.Client) error {
 	// Open the MP3 file to check for existing ID3v2 tags
-	mp3File, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+	mp3File, err := id3.Open(filePath, id3v2.Options{Parse: true})
 	if err != nil {
 		return fmt.Errorf("failed to open mp3 file: %v", err)
 	}

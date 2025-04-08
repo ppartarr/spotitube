@@ -23,6 +23,8 @@ func YouTubeDl(url, path string) error {
 			"--output", stem+".%(ext)s",
 			"--continue",
 			"--no-overwrites",
+			"--retry-sleep", "exp=1::2",
+			"--sleep-interval", "5",
 			url,
 		)
 	)
