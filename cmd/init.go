@@ -90,8 +90,8 @@ func processFile(filePath string, client *spotitubify.Client) error {
 	}
 	defer mp3File.Close()
 
-	if mp3File.HasFrames() {
-		log.Printf("File already has ID3v2 tags, skipping: %s\n", filePath)
+	if id := mp3File.SpotifyID(); len(id) > 0 {
+		log.Printf("File already has a spotify id tags, skipping: %s\n", filePath)
 		return nil
 	}
 
@@ -219,6 +219,9 @@ func updateMP3Tags(client *spotitubify.Client, filePath string, track *spotify.F
 	if err := mp3File.Save(); err != nil {
 		return fmt.Errorf("failed to save mp3 file: %v", err)
 	}
+
+	// Add the file to the index as Installed since we've set all the tags
+	indexData.SetPath(filePath, index.Installed)
 
 	fmt.Printf("Successfully updated tags for: %s\n", filePath)
 	return nil

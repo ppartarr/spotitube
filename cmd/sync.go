@@ -39,7 +39,6 @@ const (
 var (
 	routineSemaphores map[int](chan bool)
 	routineQueues     map[int](chan interface{})
-	indexData         = index.New()
 	tui               = anchor.New(anchor.Red)
 )
 
