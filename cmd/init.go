@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/streambinder/spotitube/downloader"
 	"github.com/streambinder/spotitube/entity/id3"
+	"github.com/streambinder/spotitube/entity/index"
 	"github.com/streambinder/spotitube/processor"
 	spotitubify "github.com/streambinder/spotitube/spotify"
 	"github.com/streambinder/spotitube/util"

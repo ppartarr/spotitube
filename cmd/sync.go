@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/adrg/xdg"
 	"github.com/arunsworld/nursery"
@@ -81,7 +84,7 @@ func cmdSync() *cobra.Command {
 				routineIndex(path),
 				routineAuth,
 				routineFetch(library, playlists, playlistsTracks, albums, tracks, fixes, libraryLimit),
-				routineDecide(manual),
+				routineDecide(manual, path),
 				routineCollect(lyrics),
 				routineProcess,
 				routineInstall,
@@ -103,7 +106,7 @@ func cmdSync() *cobra.Command {
 				routineTypeDecide:  make(chan interface{}, 10000),
 				routineTypeCollect: make(chan interface{}, 10000),
 				routineTypeProcess: make(chan interface{}, 10000),
-				routineTypeInstall: make(chan interface{}, 10000),
+				routineTypeInstall: make(chan interface{}, 10),
 				routineTypeMix:     make(chan interface{}, 10000),
 			}
 
@@ -137,6 +140,199 @@ func cmdSync() *cobra.Command {
 	return cmd
 }
 
+// fuzzyFindTracksForSpotify attempts to match local files without Spotify IDs to Spotify tracks
+func fuzzyFindTracksForSpotify(localPath string, tracks []*entity.Track) error {
+	// Map to store paths of files without Spotify IDs
+	filesWithoutIDs := map[string]bool{}
+
+	// First pass - collect all MP3 files without Spotify IDs
+	err := filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Only process MP3 files
+		if !strings.HasSuffix(strings.ToLower(path), entity.TrackFormat) {
+			return nil
+		}
+
+		// Check if file has Spotify ID
+		tag, err := id3.Open(path, id3v2.Options{Parse: true})
+		if err != nil {
+			return nil // Skip files we can't open
+		}
+		defer tag.Close()
+
+		// If no Spotify ID, add to our map
+		if len(tag.SpotifyID()) == 0 {
+			filesWithoutIDs[path] = true
+			tui.Printf("Found file without Spotify ID: %s", filepath.Base(path))
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	// No files without IDs found
+	if len(filesWithoutIDs) == 0 {
+		return nil
+	}
+
+	tui.Printf("Found %d files without Spotify IDs. Attempting to match with Spotify tracks...", len(filesWithoutIDs))
+
+	// For each Spotify track, try to find a matching local file
+	for _, track := range tracks {
+		// Clean track data for matching
+		cleanTerm := func(input string) string {
+			result := strings.ToLower(input)
+			result = strings.ReplaceAll(result, "&", "and")
+			result = strings.ReplaceAll(result, "-", " ")
+			result = strings.ReplaceAll(result, "_", " ")
+			result = strings.ReplaceAll(result, "(", " ")
+			result = strings.ReplaceAll(result, ")", " ")
+			result = strings.ReplaceAll(result, "[", " ")
+			result = strings.ReplaceAll(result, "]", " ")
+			result = strings.ReplaceAll(result, "feat.", "")
+			result = strings.ReplaceAll(result, "feat", "")
+			result = strings.ReplaceAll(result, "ft.", "")
+			result = strings.ReplaceAll(result, "ft", "")
+			result = strings.ReplaceAll(result, "mix", "")
+			result = strings.ReplaceAll(result, "remix", "")
+			result = strings.ReplaceAll(result, "edit", "")
+			result = strings.ReplaceAll(result, "version", "")
+			result = strings.TrimSpace(result)
+			return result
+		}
+
+		// Get track info
+		title := cleanTerm(track.Title)
+		artist := cleanTerm(track.Artists[0])
+
+		// Get base title (without remix info)
+		baseTitle := track.Title
+		if idx := strings.Index(baseTitle, " -"); idx > 0 {
+			baseTitle = strings.TrimSpace(baseTitle[:idx])
+		}
+		if idx := strings.Index(baseTitle, "("); idx > 0 {
+			baseTitle = strings.TrimSpace(baseTitle[:idx])
+		}
+		baseTitle = cleanTerm(baseTitle)
+
+		// Extract individual words for matching
+		titleWords := strings.Fields(title)
+		artistWords := strings.Fields(artist)
+
+		// For each file without an ID, see if it matches this track
+		for filePath := range filesWithoutIDs {
+			fileName := strings.ToLower(filepath.Base(filePath))
+			cleanFileName := cleanTerm(fileName)
+
+			// Check for matches using different criteria
+			isMatch := false
+
+			// High priority match - exact artist and title
+			if strings.Contains(cleanFileName, artist) && strings.Contains(cleanFileName, title) {
+				isMatch = true
+			} else if strings.Contains(cleanFileName, artist) && strings.Contains(cleanFileName, baseTitle) {
+				// Medium priority - artist and base title (without remix info)
+				isMatch = true
+			} else {
+				// Lower priority - look for combinations of words
+				matchCount := 0
+				// Check for title words
+				for _, word := range titleWords {
+					if len(word) > 3 && strings.Contains(cleanFileName, word) {
+						matchCount++
+					}
+				}
+				// Check for artist words
+				for _, word := range artistWords {
+					if len(word) > 3 && strings.Contains(cleanFileName, word) {
+						matchCount++
+					}
+				}
+
+				// If we match at least 2 words and include at least one word from both title and artist
+				if matchCount >= 2 {
+					titleWordFound := false
+					artistWordFound := false
+
+					for _, word := range titleWords {
+						if len(word) > 3 && strings.Contains(cleanFileName, word) {
+							titleWordFound = true
+							break
+						}
+					}
+
+					for _, word := range artistWords {
+						if len(word) > 3 && strings.Contains(cleanFileName, word) {
+							artistWordFound = true
+							break
+						}
+					}
+
+					if titleWordFound && artistWordFound {
+						isMatch = true
+					}
+				}
+			}
+
+			// If we found a match, update the ID3 tags and index
+			if isMatch {
+				tui.Printf("Possible match: '%s' ⟶ '%s - %s'", filepath.Base(filePath), track.Artists[0], track.Title)
+
+				// Ask user for confirmation
+				tui.Printf("Would you like to update this file with Spotify metadata? (y/n)")
+				confirmation := tui.Reads("Confirm (y/n):")
+
+				if strings.ToLower(confirmation) == "y" {
+					// Update the ID3 tags
+					tag, err := id3.Open(filePath, id3v2.Options{Parse: true})
+					if err != nil {
+						tui.Printf("Failed to open file for tagging: %s", err)
+						continue
+					}
+
+					tag.SetSpotifyID(track.ID)
+					tag.SetTitle(track.Title)
+					tag.SetArtist(track.Artists[0])
+					tag.SetAlbum(track.Album)
+					tag.SetArtworkURL(track.Artwork.URL)
+					tag.SetDuration(strconv.Itoa(track.Duration))
+					tag.SetTrackNumber(strconv.Itoa(track.Number))
+					tag.SetYear(strconv.Itoa(track.Year))
+
+					if err := tag.Save(); err != nil {
+						tui.Printf("Failed to save tags: %s", err)
+						tag.Close()
+						continue
+					}
+
+					tag.Close()
+
+					// Update the index
+					indexData.SetPath(filePath, index.Installed)
+
+					// Remove from our map so we don't try to match it again
+					delete(filesWithoutIDs, filePath)
+
+					tui.Printf("Successfully updated tags for: %s", filepath.Base(filePath))
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // indexer scans a possible local music library
 // to be considered as already synchronized
 func routineIndex(path string) func(context.Context, chan error) {
@@ -151,9 +347,48 @@ func routineIndex(path string) func(context.Context, chan error) {
 			ch <- err
 			return
 		}
+		tui.Lot("index").Printf("%d tracks indexed", indexData.Size())
+
+		// Before we signal that indexing is complete, check if we should
+		// try to match local files without Spotify IDs to Spotify tracks
+		spotifyClient, err := spotify.Authenticate(spotify.BrowserProcessor)
+		if err != nil {
+			tui.Printf("authentication for fuzzy matching failed: %s", err)
+			tui.Lot("index").Close(strconv.Itoa(indexData.Size()) + " tracks")
+			routineSemaphores[routineTypeIndex] <- true
+			return
+		}
+
+		// Get some tracks from the user's library to try to match against
+		tracksChan := make(chan interface{}, 1000)
+		trackList := []*entity.Track{}
+
+		// Fetch tracks from the user's Spotify library
+		go func() {
+			if err := spotifyClient.Library(100, tracksChan); err != nil {
+				tui.Printf("Error fetching library: %s", err)
+				close(tracksChan)
+				return
+			}
+			close(tracksChan)
+		}()
+
+		// Collect tracks
+		for track := range tracksChan {
+			trackList = append(trackList, track.(*entity.Track))
+		}
+
+		// If we got tracks, try to match them against local files without Spotify IDs
+		if len(trackList) > 0 {
+			tui.Lot("index").Printf("attempting to match files with Spotify tracks")
+			if err := fuzzyFindTracksForSpotify(path, trackList); err != nil {
+				tui.Printf("Error during fuzzy matching: %s", err)
+			}
+		}
+
 		tui.Lot("index").Close(strconv.Itoa(indexData.Size()) + " tracks")
 
-		// once indexed, sidgnal fetcher
+		// once indexed, signal fetcher
 		routineSemaphores[routineTypeIndex] <- true
 	}
 }
@@ -298,7 +533,7 @@ func routineFetchPlaylists(playlists []string, fetched chan interface{}) error {
 
 // decider finds the right asset to retrieve
 // for a given track
-func routineDecide(manualMode bool) func(context.Context, chan error) {
+func routineDecide(manualMode bool, outputDir string) func(context.Context, chan error) {
 	return func(_ context.Context, ch chan error) {
 		// remember to stop passing data to the collector
 		// the retriever, the composer and the painter
@@ -307,6 +542,30 @@ func routineDecide(manualMode bool) func(context.Context, chan error) {
 		for event := range routineQueues[routineTypeDecide] {
 			track := event.(*entity.Track)
 
+			// First check if we already have this track by Spotify ID
+			if _, err := os.Stat(track.Path().Final()); err == nil {
+				tag, err := id3.Open(track.Path().Final(), id3v2.Options{Parse: true})
+				if err == nil {
+					defer tag.Close()
+					if existingID := tag.SpotifyID(); existingID == track.ID {
+						tui.Printf("track %s already exists with matching ID: %s", track.Path().Final(), existingID)
+						indexData.Set(track, index.Installed)
+						continue
+					} else if existingID != track.ID {
+						tui.Printf("track %s has a different ID (%s) that the one in the playlist (%s). Updating ID...", track.Path().Final(), existingID, track.ID)
+						tag.SetSpotifyID(track.ID)
+						if err := tag.Save(); err != nil {
+							tui.AnchorPrintf("failed to update tags: %s", err)
+							tag.Close()
+							continue
+						}
+						continue
+					}
+				}
+			} else {
+				tui.Printf("couldn't find track: %s", track.Path().Final())
+			}
+
 			if status, ok := indexData.Get(track); !ok {
 				tui.Printf("sync %s by %s", track.Title, track.Artists[0])
 				indexData.Set(track, index.Online)
@@ -314,16 +573,136 @@ func routineDecide(manualMode bool) func(context.Context, chan error) {
 				tui.Printf("skip %s by %s", track.Title, track.Artists[0])
 				continue
 			} else if status == index.Offline {
+				tui.Printf("missing %s by %s", track.Title, track.Artists[0])
 				continue
 			}
 
 			if manualMode {
 				tui.Lot("decide").Printf("waiting on user input")
-				track.UpstreamURL = tui.Reads("URL for %s by %s:", track.Title, track.Artists[0])
-				tui.Lot("decide").Wipe()
-				if len(track.UpstreamURL) == 0 {
+				tui.Printf("For track: %s by %s", track.Title, track.Artists[0])
+				tui.Printf("0. Skip this track")
+				tui.Printf("1. Download with URL")
+				tui.Printf("2. Fuzzy search for local file (default)")
+				choice := tui.Reads("Choose an option [2]:")
+
+				// Default to option 2 if user just presses Enter
+				if choice == "" {
+					choice = "2"
+					tui.Printf("Using default option: 2")
+				}
+
+				switch choice {
+				case "0":
+					// Skip this track
+					tui.Printf("Skipping track: %s by %s", track.Title, track.Artists[0])
+					tui.Lot("decide").Wipe()
+					continue
+
+				case "1":
+					// Option 1: Download with URL
+					url := tui.Reads("Enter URL:")
+					tui.Lot("decide").Wipe()
+					if len(url) == 0 {
+						continue
+					}
+					track.UpstreamURL = url
+
+				case "2":
+					// Option 2: Fuzzy search for local file
+					// Search the output directory for matching files
+					tui.Printf("Searching for files matching: %s by %s", track.Title, track.Artists[0])
+
+					// Get all files that might match
+					matches, err := fuzzySearchLocalFiles(outputDir, track)
+					if err != nil {
+						tui.AnchorPrintf("search failed: %s", err)
+						continue
+					}
+
+					if len(matches) == 0 {
+						tui.Printf("No matching files found")
+						continue
+					}
+
+					// Display numbered list of options
+					tui.Printf("Found %d potential matches:", len(matches))
+					for i, match := range matches {
+						tui.Printf("%d. %s", i+1, filepath.Base(match))
+					}
+
+					// Let user select a file (with 1 as default)
+					tui.Printf("Press Enter for #1 or select a file (1-%d) or 0 to cancel:", len(matches))
+					selection := tui.Reads("Select [1]:")
+					tui.Lot("decide").Wipe()
+
+					// Parse selection, default to 1 if empty
+					var selectionNum int
+					if selection == "" {
+						selectionNum = 1
+						tui.Printf("Using default selection: 1")
+					} else {
+						var parseErr error
+						selectionNum, parseErr = strconv.Atoi(selection)
+						if parseErr != nil || selectionNum < 0 || selectionNum > len(matches) {
+							tui.AnchorPrintf("invalid selection")
+							continue
+						}
+					}
+
+					// If user cancels
+					if selectionNum == 0 {
+						tui.Printf("Selection cancelled")
+						continue
+					}
+
+					selectedFile := matches[selectionNum-1]
+
+					// Update the file: rename it to match the expected format
+					expectedPath := filepath.Join(filepath.Dir(selectedFile), track.Path().Final())
+
+					tui.Printf("Renaming file from: %s to: %s", filepath.Base(selectedFile), filepath.Base(expectedPath))
+
+					// Check and update tags first
+					tag, err := id3.Open(selectedFile, id3v2.Options{Parse: true})
+					if err != nil {
+						tui.AnchorPrintf("failed to open selected file: %s", err)
+						continue
+					}
+
+					// Update tags
+					tag.SetSpotifyID(track.ID)
+					tag.SetTitle(track.Title)
+					tag.SetArtist(track.Artists[0])
+					tag.SetAlbum(track.Album)
+					tag.SetArtworkURL(track.Artwork.URL)
+					tag.SetDuration(strconv.Itoa(track.Duration))
+					tag.SetTrackNumber(strconv.Itoa(track.Number))
+					tag.SetYear(strconv.Itoa(track.Year))
+
+					if err := tag.Save(); err != nil {
+						tui.AnchorPrintf("failed to update tags: %s", err)
+						tag.Close()
+						continue
+					}
+
+					tag.Close()
+
+					// Rename the file
+					if err := util.FileMoveOrCopy(selectedFile, expectedPath, true); err != nil {
+						tui.AnchorPrintf("failed to rename file: %s", err)
+						continue
+					}
+
+					// Update index
+					indexData.Set(track, index.Installed)
+					tui.Printf("File successfully renamed and tagged")
+					continue
+
+				default:
+					tui.AnchorPrintf("invalid option, skipping track")
 					continue
 				}
+
 			} else {
 				tui.Lot("decide").Printf("%s by %s", track.Title, track.Artists[0])
 				matches, err := provider.Search(track)
@@ -343,6 +722,151 @@ func routineDecide(manualMode bool) func(context.Context, chan error) {
 		}
 		tui.Lot("decide").Close()
 	}
+}
+
+// fuzzySearchLocalFiles searches for files in the given directory that might match the track
+func fuzzySearchLocalFiles(dir string, track *entity.Track) ([]string, error) {
+	var results []string
+
+	// Clean and prepare search terms for better matching
+	cleanTerm := func(input string) string {
+		// Remove common separators and words that might be formatted differently
+		result := strings.ToLower(input)
+		result = strings.ReplaceAll(result, "&", "and")
+		result = strings.ReplaceAll(result, " - ", " ")
+		result = strings.ReplaceAll(result, " - ", " ")
+		result = strings.ReplaceAll(result, "-", "")
+		result = strings.ReplaceAll(result, "_", " ")
+		result = strings.ReplaceAll(result, "(", " ")
+		result = strings.ReplaceAll(result, ")", " ")
+		result = strings.ReplaceAll(result, "[", " ")
+		result = strings.ReplaceAll(result, "]", " ")
+		result = strings.ReplaceAll(result, "feat.", " ")
+		result = strings.ReplaceAll(result, "feat", " ")
+		result = strings.ReplaceAll(result, "ft.", " ")
+		result = strings.ReplaceAll(result, "ft", " ")
+		// Remove common genre/remix indicators that might be formatted differently
+		result = strings.ReplaceAll(result, " mix", " ")
+		result = strings.ReplaceAll(result, " remix", " ")
+		result = strings.ReplaceAll(result, " edit", " ")
+		result = strings.ReplaceAll(result, " version", " ")
+		result = strings.ReplaceAll(result, " original", " ")
+		// Clean up extra spaces
+		result = strings.TrimSpace(result)
+		// Replace multiple spaces with a single space
+		space := regexp.MustCompile(`\s+`)
+		result = space.ReplaceAllString(result, " ")
+		return result
+	}
+
+	// Get base title without any remix information
+	baseTitle := track.Song()
+
+	// Create a special filename pattern that matches artist-title pattern
+	expectedFilenamePattern := fmt.Sprintf("%s - %s",
+		regexp.QuoteMeta(strings.ReplaceAll(track.Artists[0], ".", "")),
+		regexp.QuoteMeta(baseTitle))
+
+	// Clean the terms for matching
+	cleanedTitle := cleanTerm(track.Title)
+	cleanedBaseTitle := cleanTerm(baseTitle)
+	cleanedArtist := cleanTerm(track.Artists[0])
+
+	// Words to extract from title and artist for individual word matching
+	titleWords := strings.Fields(cleanedTitle)
+	artistWords := strings.Fields(cleanedArtist)
+
+	// Debug info
+	// tui.Printf("Searching for '%s - %s' (base title: '%s')", track.Artists[0], track.Title, baseTitle)
+
+	type ScoredMatch struct {
+		Path  string
+		Score int
+	}
+	var scoredMatches []ScoredMatch
+
+	// Walk through the directory
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		// Skip directories and non-music files
+		if err != nil || info.IsDir() || !strings.HasSuffix(strings.ToLower(path), entity.TrackFormat) {
+			return nil
+		}
+
+		// Get filename without extension
+		fileName := filepath.Base(path)
+		fileNameWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+		cleanedFileName := cleanTerm(fileName)
+
+		// Calculate match score
+		score := 0
+
+		// Check for exact artist-title pattern (highest priority - 100 points)
+		re := regexp.MustCompile("(?i)" + expectedFilenamePattern)
+		if re.MatchString(fileName) {
+			score += 100
+			// tui.Printf("Exact pattern match: %s", fileName)
+		}
+
+		// Check for artist appearing in filename (high priority - 50 points)
+		artistRe := regexp.MustCompile("(?i)" + regexp.QuoteMeta(track.Artists[0]))
+		if artistRe.MatchString(fileName) {
+			score += 50
+		}
+
+		// Check for base title appearing in filename (high priority - 40 points)
+		baseTitleRe := regexp.MustCompile("(?i)" + regexp.QuoteMeta(baseTitle))
+		if baseTitleRe.MatchString(fileName) {
+			score += 40
+		}
+
+		// Check for artist-title format (Artist - Title) - 30 points
+		if strings.Contains(fileNameWithoutExt, " - ") {
+			parts := strings.SplitN(fileNameWithoutExt, " - ", 2)
+			artistPart := cleanTerm(parts[0])
+			titlePart := cleanTerm(parts[1])
+
+			// If parts match artist and base title, give high score
+			if strings.Contains(artistPart, cleanedArtist) && strings.Contains(titlePart, cleanedBaseTitle) {
+				score += 30
+			}
+		}
+
+		// Award points for matching individual significant words from title and artist
+		for _, word := range titleWords {
+			if len(word) > 3 && strings.Contains(cleanedFileName, word) {
+				score += 5
+			}
+		}
+
+		for _, word := range artistWords {
+			if len(word) > 3 && strings.Contains(cleanedFileName, word) {
+				score += 5
+			}
+		}
+
+		// If we have any score, add it to our results
+		if score > 0 {
+			scoredMatches = append(scoredMatches, ScoredMatch{Path: path, Score: score})
+		}
+
+		return nil
+	})
+
+	// Sort results by score (highest first)
+	sort.Slice(scoredMatches, func(i, j int) bool {
+		return scoredMatches[i].Score > scoredMatches[j].Score
+	})
+
+	// Take top 10 results
+	for i, match := range scoredMatches {
+		if i >= 10 {
+			break
+		}
+		results = append(results, match.Path)
+		// tui.Printf("Match: %s (score: %d)", filepath.Base(match.Path), match.Score)
+	}
+
+	return results, err
 }
 
 // collector fetches all the needed assets

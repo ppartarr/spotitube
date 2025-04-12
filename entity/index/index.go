@@ -25,10 +25,23 @@ type Index struct {
 }
 
 func keyFromTrack(track *entity.Track) string {
+	// If the track has a Spotify ID, use that as the key
+	if len(track.ID) > 0 {
+		return track.ID
+	}
 	return keyFromPath(track.Path().Final())
 }
 
 func keyFromPath(path string) string {
+	// For files on disk, try to get the Spotify ID from the tags first
+	tag, err := id3.Open(path, id3v2.Options{Parse: true})
+	if err == nil {
+		defer tag.Close()
+		if id := tag.SpotifyID(); len(id) > 0 {
+			return id
+		}
+	}
+	// Fall back to slugified filename if no Spotify ID is available
 	return slug.Make(filepath.Base(path))
 }
 
